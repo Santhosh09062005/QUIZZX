@@ -1,5 +1,5 @@
-import { User } from "@clerk/express";
 import mongoose from "mongoose";
+
 // we've created a mongoose useschema in this folder
 const userSchema= new mongoose.Schema({
     clerkId:{

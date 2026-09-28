@@ -1,11 +1,11 @@
 import express from 'express';
-import { clerkWebhook } from '../conrollers/webhook.js';
+import { clerkWebhook } from '../controllers/webhook.js';
 
-const router =express.Router();
+const router = express.Router();
 
-router.post("/webhhok/clerk",
-    express.raw({type: "application/json"}),
+router.post('/webhook/clerk',
+    express.raw({ type: 'application/json' }),
     clerkWebhook
 );
 
-export default router;
+export default router;
