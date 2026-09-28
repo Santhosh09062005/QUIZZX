@@ -1,0 +1,477 @@
+
+================================================================================
+             QUIZZX — FULL PROJECT TECHNICAL REFERENCE DOCUMENT
+================================================================================
+
+PROJECT NAME   : QUIZZX
+AUTHOR         : Santhosh S
+TYPE           : Full-Stack Web Application (Multi-Role Quiz Platform)
+DATABASE       : MongoDB Atlas
+REPO STRUCTURE : Monorepo — /backend, /frontend, /admin under Quiz_App/
+
+
+--------------------------------------------------------------------------------
+  TECH STACK SUMMARY
+--------------------------------------------------------------------------------
+
+LAYER           | TECHNOLOGY
+----------------|-------------------------------------------------------------
+Backend         | Node.js, Express v5, ES Modules (type: "module")
+Database        | MongoDB Atlas + Mongoose v9
+Authentication  | Clerk (@clerk/express, @clerk/react)
+Webhook Relay   | Svix (Clerk's webhook signing library)
+File Parsing    | csv-parse (installed), custom client-side CSV parser used
+File Upload     | Multer (installed), FileReader API used on frontend instead
+Frontend        | React 19, Vite 8, TailwindCSS v4, React Router DOM v7
+Admin Panel     | React 19, Vite 8, TailwindCSS v4, React Router DOM v7
+HTTP Client     | Axios
+Icons           | lucide-react
+Dev Tools       | Nodemon, ESLint
+
+
+--------------------------------------------------------------------------------
+  PROJECT DIRECTORY STRUCTURE
+--------------------------------------------------------------------------------
+
+Quiz_App/
+├── backend/
+│   ├── server.js                 ← Express app entry point
+│   ├── config/
+│   │   └── db.js                 ← MongoDB connection (Mongoose)
+│   ├── model/
+│   │   ├── User.js               ← User schema (clerkId, role, isLoggedIn)
+│   │   ├── Quiz.js               ← Quiz + Question schemas
+│   │   └── Result.js             ← Quiz result schema
+│   ├── controllers/
+│   │   ├── userController.js     ← Admin stats (total users, logged-in %)
+│   │   ├── resultController.js   ← Save result, fetch user's results
+│   │   └── webhook.js            ← Clerk webhook event handler
+│   ├── model/
+│   │   └── adminController.js    ← Upload quiz, get all quizzes, delete quiz
+│   ├── middleware/
+│   │   └── auth.js               ← protect (JWT verify), isAdmin (role check)
+│   └── routes/
+│       ├── user.js               ← POST /api/users/webhook/clerk
+│       ├── admin.js              ← Admin CRUD + stats routes
+│       └── result.js             ← Result save/fetch routes
+│
+├── frontend/                     ← User-facing app (Vite)
+│   └── src/
+│       ├── main.jsx              ← Entry: ClerkProvider > BrowserRouter > App
+│       ├── App.jsx               ← React Router routes (/, /result)
+│       ├── pages/
+│       │   ├── Home.jsx          ← Renders Navbar + Sidebar
+│       │   └── MyResult.jsx      ← Renders MyResultPage
+│       ├── components/
+│       │   ├── Sidebar.jsx       ← CORE: Quiz engine UI (all quiz logic)
+│       │   ├── Navbar.jsx        ← Top nav with Clerk SignIn/SignOut
+│       │   └── MyResultPage.jsx  ← Displays user's quiz history
+│       └── services/api/
+│           └── api.js            ← useApi hook (Axios + Clerk JWT)
+│
+└── admin/                        ← Admin panel app (Vite, separate)
+    └── src/
+        ├── main.jsx              ← Entry: ClerkProvider > BrowserRouter > App
+        ├── App.jsx               ← Routes with RequireAuth wrapper
+        ├── pages/
+        │   ├── Home.jsx          ← Renders Hero + redirect to dashboard
+        │   ├── DashboardPage.jsx ← Renders Dashboard component
+        │   └── List.jsx          ← Renders ListPage component
+        └── components/
+            ├── Dashboard.jsx     ← Upload quiz via CSV + user stats
+            ├── ListPage.jsx      ← View & delete all quizzes
+            └── Navbar.jsx        ← Admin nav with Clerk auth
+
+
+--------------------------------------------------------------------------------
+  BACKEND SETUP
+--------------------------------------------------------------------------------
+
+ENTRY POINT: backend/server.js
+  - Imports express, cors, dotenv, clerkMiddleware, routes
+  - Port: process.env.PORT (from .env)
+  - Middleware order (IMPORTANT):
+      app.use(clerkMiddleware())    ← Must be first — attaches req.auth globally
+      app.use(cors())
+      app.use("/api/users", userRoutes)    ← Before express.json() (raw body for webhook)
+      app.use(express.json())
+      
+  NOTE: The webhook route is registered BEFORE express.json() because Svix
+  signature verification needs the raw request body (Buffer), not parsed JSON.
+
+DATABASE CONNECTION: backend/config/db.js
+  - Uses mongoose.connect() with MongoDB Atlas URI
+  - Database name: QUIZZX
+  - Called once at server startup (connectDB())
+
+ENV VARIABLES (.env):
+  PORT=8080
+  MONGODB_URI=<your atlas connection string>
+  CLERK_PUBLISHABLE_KEY=<clerk key>
+  CLERK_SECRET_KEY=<clerk secret>
+  CLERK_WEBHOOK_SECRET=<svix signing secret>
+
+
+--------------------------------------------------------------------------------
+  MONGODB SCHEMAS (Mongoose)
+--------------------------------------------------------------------------------
+
+1. USER SCHEMA (model/User.js)
+   ─────────────────────────────
+   Field       | Type    | Details
+   ------------|---------|---------------------------------------------
+   clerkId     | String  | Unique, required — Clerk's user ID
+   fullName    | String  | From Clerk's first_name + last_name
+   email       | String  | Required, primary email from Clerk
+   role        | String  | Enum: ['User', 'admin'], default: 'User'
+   isLoggedIn  | Boolean | Updated by webhook: session.created/ended
+   timestamps  | Auto    | createdAt, updatedAt
+
+2. QUIZ SCHEMA (model/Quiz.js)
+   ─────────────────────────────
+   Quiz fields:
+   Field          | Type         | Details
+   ---------------|--------------|----------------------------------------
+   technology     | String       | Required, lowercase, trimmed
+   level          | String       | Enum: ['Basic','Intermediate','Advanced']
+   timeLimit      | Number       | In minutes, min: 1
+   questions      | [Question]   | Array of embedded question documents
+   totalQuestions | Number       | questions.length (denormalized)
+   createdBy      | String       | Clerk userId of the admin who uploaded
+   
+   Embedded Question fields:
+   Field     | Type     | Details
+   ----------|----------|----------------------------------------------
+   question  | String   | The question text, required, trimmed
+   options   | [String] | Exactly 4 options, validated
+   answerKey | String   | Enum: ['A','B','C','D']
+   
+   Virtual:
+   answerText → options[{A:0,B:1,C:2,D:3}[answerKey]]
+   (Computed property — not stored in DB)
+   
+   INDEX: { technology: 1, level: 1 } → unique compound index
+   (Prevents duplicate quiz for same tech + level)
+
+3. RESULT SCHEMA (model/Result.js)
+   ──────────────────────────────────
+   Field          | Type   | Details
+   ---------------|--------|----------------------------------------------
+   userId         | String | Clerk userId — ties result to a specific user
+   technology     | String | e.g., "javascript"
+   level          | String | e.g., "Basic"
+   totalQuestions | Number |
+   correct        | Number |
+   wrong          | Number |
+   timeTaken      | Number | In seconds
+   startDate      | Date   | When the quiz was started
+   timestamps     | Auto   | createdAt, updatedAt
+
+
+--------------------------------------------------------------------------------
+  API ROUTES
+--------------------------------------------------------------------------------
+
+BASE URL: http://localhost:8080/api
+
+  USER / WEBHOOK ROUTES (/api/users)
+  ─────────────────────────────────────
+  POST /api/users/webhook/clerk
+    Handler : controllers/webhook.js → clerkWebhook
+    Middleware: express.raw({ type: "application/json" }) — raw body needed
+    Purpose : Listens for Clerk events:
+              • user.created   → create/upsert User in DB, assign role
+              • session.created → set isLoggedIn = true
+              • session.ended   → set isLoggedIn = false
+              • session.removed → set isLoggedIn = false
+    Security: Svix signature verification (wh.verify(payload, headers))
+
+  ADMIN ROUTES (/api/admin)
+  ───────────────────────────
+  GET    /api/admin/stats
+    Handler   : userController → getStats
+    Auth      : Reads Clerk userId via getAuth(req)
+    Returns   : { totalUsers, loggedInUsers, loggedInPercentage }
+    
+  GET    /api/admin/quizzes
+    Handler   : adminController → getAllQuizzes
+    Auth      : None (public — frontend reads quiz list)
+    Returns   : All quizzes sorted by createdAt desc
+
+  POST   /api/admin/upload-quiz
+    Handler   : adminController → uploadQuiz
+    Auth      : protect (JWT verify) + isAdmin (role check)
+    Body      : { technology, level, timeLimit, questions[] }
+    Logic     : findOneAndUpdate with upsert:true on (technology, level)
+    Returns   : { success: true, quiz }
+
+  DELETE /api/admin/quiz/:id
+    Handler   : adminController → deleteQuiz
+    Auth      : protect + isAdmin
+    Returns   : { success: true, message }
+
+  RESULT ROUTES (/api/result)
+  ─────────────────────────────
+  POST   /api/result/save-result
+    Handler   : resultController → CreatemyResult
+    Auth      : Reads userId from getAuth(req)
+    Body      : { technology, level, totalQuestions, correct, wrong, timeTaken, startDate }
+    Logic     : Result.create({ ...req.body, userId })
+    Returns   : Saved result document
+
+  GET    /api/result/my-result
+    Handler   : resultController → getMyResults
+    Auth      : Reads userId from getAuth(req)
+    Logic     : Result.find({ userId }).sort({ createdAt: -1 })
+    Returns   : Array of result documents for the logged-in user
+
+
+--------------------------------------------------------------------------------
+  AUTHENTICATION FLOW
+--------------------------------------------------------------------------------
+
+1. USER SIGN-UP (handled by Clerk UI)
+   - User completes sign-up via Clerk's hosted or embedded UI
+   - Clerk fires "user.created" webhook → backend receives it → User document
+     created in MongoDB with clerkId, email, fullName
+   - Role assignment: if email === admin email → role:"admin", else role:"User"
+
+2. USER SIGN-IN (handled by Clerk UI)
+   - Clerk fires "session.created" webhook → backend sets isLoggedIn = true
+   
+3. USER SIGN-OUT
+   - Clerk fires "session.ended" or "session.removed" → isLoggedIn = false
+
+4. PROTECTED API CALLS
+   - Frontend: useApi hook calls Clerk's getToken() → JWT included as
+     Authorization: Bearer <token>
+   - Backend: clerkMiddleware() (global) parses the JWT, attaches req.auth
+   - Route-level: protect = ClerkExpressWithAuth() ensures JWT is valid
+   - Route-level: isAdmin checks User.role === 'admin' in MongoDB
+
+5. FRONTEND AUTH STATE
+   - ClerkProvider wraps entire app in main.jsx
+   - useAuth().isLoaded → wait for auth to initialize (prevents flash)
+   - useUser().isSignedIn → show/hide UI
+   - Clerk's <Show when="signed-in/signed-out"> for conditional rendering
+
+
+--------------------------------------------------------------------------------
+  FRONTEND SETUP (User App)
+--------------------------------------------------------------------------------
+
+ENTRY: frontend/src/main.jsx
+  createRoot renders:
+    <ClerkProvider publishableKey={VITE_CLERK_PUBLISHABLE_KEY}>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    </ClerkProvider>
+
+ROUTES (App.jsx):
+  /        → <Home /> (public — Navbar + Sidebar/Quiz Engine)
+  /result  → <MyResult /> (protected with Clerk's <Show> component)
+             If signed-out → <Navigate to="/" />
+
+KEY COMPONENT — Sidebar.jsx (Quiz Engine Core):
+  This is the largest and most important component (~2650 lines).
+  It handles ALL quiz logic:
+  
+  STATE:
+    questionsData    → { [tech]: { [level]: { questions[], timeLimit } } }
+    technologies     → Array of { id, name, color, icon }
+    selectedTech     → Currently selected technology string
+    selectedLevel    → Currently selected level string
+    currentQuestion  → Index of current question (0-based)
+    userAnswers      → { [questionIndex]: answerIndex } (answer map)
+    completedQuestions → Set of answered question indices
+    isQuizStarted    → Boolean (quiz is actively running)
+    isSubmitted      → Boolean (quiz submitted/auto-submitted)
+    reviewMode       → Boolean (viewing answers after submit)
+    showResults      → Boolean (results screen visible)
+    timeLeft         → Seconds remaining
+    elapsedTime      → Seconds elapsed since quiz start
+    timerStartedAt   → Date.now() timestamp when timer last started
+    progressByTech   → { [tech]: { [level]: { all state fields } } }
+
+  KEY FUNCTIONS:
+    handleStartQuiz()    → Checks auth, initializes state, starts timer
+    handleAnswerSelect() → Records answer, persists to localStorage
+    handleTimeUp()       → Auto-submit: fill unanswered as -1, calculate
+                           score, POST to backend, show results
+    calculateScore()     → Returns { correct, incorrect, unattempted,
+                           total, percentage }
+    persistProgressForLevel() → Saves current state to localStorage under
+                           the nested key progressByTech[tech][level]
+    saveTimerState()     → Saves timer + all progress to localStorage
+    startTimer()         → setInterval decrement + track timerStartedAt
+    stopTimer()          → clearInterval + saveTimerState
+    
+  TIMER RESUME LOGIC (on page refresh):
+    1. Load state from localStorage
+    2. Read savedProgress.timerStartedAt + savedProgress.elapsedTime
+    3. remainingTime = totalLimit - elapsedTime
+    4. setTimeLeft(remainingTime), then startTimer()
+    
+  PERSISTENCE KEY: "techQuizMasterProgress" in localStorage
+  STRUCTURE:
+    {
+      currentTech: "javascript",
+      currentLevel: "Basic",
+      progressByTech: {
+        "javascript": {
+          "Basic": {
+            currentQuestion, userAnswers, showResults,
+            completedQuestions, isSubmitted, reviewMode,
+            timeLeft, timerStartedAt, elapsedTime, isQuizStarted
+          }
+        }
+      },
+      timestamp: ISO string
+    }
+
+  EVENTS HANDLED:
+    - visibilitychange → save state when tab becomes hidden
+    - beforeunload     → save state when window is closing
+    - resize           → toggle sidebar open/close based on screen width
+                         (open by default on >= 1024px / lg breakpoint)
+    - mousedown/touchstart on document → close sidebar on outside click
+                         (only on screens < 1024px)
+
+  ANSWER KEY MAPPING:
+    DB stores answerKey as "A"/"B"/"C"/"D"
+    Frontend maps to index: { A:0, B:1, C:2, D:3 }
+    correctAnswer = ["A","B","C","D"].indexOf(answerKey.toUpperCase())
+    User answer is stored as the selected option INDEX (0-3)
+
+RESULT PAGE — MyResultPage.jsx:
+  - Fetches results via GET /api/result/my-result on mount
+  - Groups results by technology track using useMemo
+  - Each result card shows: title, total questions, correct, wrong,
+    unattempted, percentage, performance badge, date, time taken
+  - Collapsible cards with toggle open/close state
+
+
+--------------------------------------------------------------------------------
+  ADMIN PANEL SETUP
+--------------------------------------------------------------------------------
+
+ENTRY: admin/src/main.jsx
+  ClerkProvider > BrowserRouter > App
+
+ROUTES (admin/src/App.jsx):
+  /           → <Home /> (public — landing with sign-in prompt)
+  /list       → <RequireAuth><List /></RequireAuth>
+  /dashboard  → <RequireAuth><DashboardPage /></RequireAuth>
+  
+  RequireAuth: Custom wrapper that checks isLoaded + isSignedIn from
+  Clerk's useUser(). If not signed in, shows message with link to home.
+
+DASHBOARD COMPONENT (components/Dashboard.jsx):
+  Two main functions:
+  
+  A) USER STATS SECTION:
+     - Fetches GET /api/admin/stats on mount
+     - Displays: totalUsers, loggedInUsers, loggedInPercentage
+
+  B) QUIZ UPLOAD SECTION:
+     - Form fields: technology (text), level (dropdown), timeLimit (number)
+     - CSV Upload:
+         • Drag-and-drop OR file input
+         • Reads file with FileReader.readAsText()
+         • Parses with custom parseCSVText() function
+         • CSV expected format: question, optA, optB, optC, optD, answer
+         • Answer column flexible: accepts A/B/C/D, 1/2/3/4, or answer text
+         • Shows parsed question preview before upload
+         • Validate form (technology, level, timeLimit, questions required)
+         • POST /api/admin/upload-quiz with { technology, level, timeLimit, questions }
+
+LIST PAGE COMPONENT (components/ListPage.jsx):
+  - Fetches all quizzes on mount (GET /api/admin/quizzes)
+  - Displays: technology, level, timeLimit, totalQuestions, uploadDate
+  - Search by technology name
+  - Filter by level (All / Basic / Intermediate / Advanced)
+  - Delete: confirmation modal → DELETE /api/admin/quiz/:id
+  - Toast notifications for success/error
+
+
+--------------------------------------------------------------------------------
+  API SERVICE LAYER (useApi hook)
+--------------------------------------------------------------------------------
+
+FILE: frontend/src/services/api/api.js
+       admin/src/services/api/api.js   (identical in both apps)
+
+  const BASE_URL = "http://localhost:8080/api"
+  
+  axios instance: apiClient with baseURL and Content-Type: application/json
+  
+  useApi() hook:
+    const { getToken } = useAuth()  ← Clerk hook
+    
+    request(endpoint, method='GET', body=null):
+      1. token = await getToken()   ← Fresh JWT from Clerk on every call
+      2. If token exists → Authorization: Bearer <token> header
+      3. apiClient({ url, method, data: body, headers })
+      4. Returns response.data
+      5. On error: throws Error with backend message or "API Error"
+
+
+--------------------------------------------------------------------------------
+  IMPORTANT IMPLEMENTATION DETAILS
+--------------------------------------------------------------------------------
+
+1. UPSERT PATTERN FOR QUIZ UPLOAD
+   Quiz.findOneAndUpdate(
+     { technology: tech.toLowerCase(), level },  ← query
+     { technology, level, timeLimit, questions, totalQuestions, createdBy },
+     { new: true, upsert: true }                 ← create if not exists
+   )
+   This means re-uploading a quiz for the same tech+level updates it.
+
+2. AUTO-SUBMIT RACE CONDITION GUARD
+   const hasAutoSubmittedRef = useRef(false)
+   In handleTimeUp():
+     if (hasAutoSubmittedRef.current) return  ← exit early
+     hasAutoSubmittedRef.current = true        ← lock before any async work
+   In handleStartQuiz():
+     hasAutoSubmittedRef.current = false       ← reset for new quiz
+
+3. WEBHOOK RAW BODY REQUIREMENT
+   The /api/users/webhook/clerk route uses:
+   express.raw({ type: "application/json" })
+   Because Svix needs the original raw bytes to verify the HMAC signature.
+   If express.json() runs first and parses the body, verification fails.
+   That's why the user route is registered BEFORE app.use(express.json()).
+
+4. MULTI-LEVEL PROGRESS ISOLATION
+   progressByTech[tech][level] = { ...all state }
+   Switching from JavaScript→Basic to Python→Advanced saves JS progress and
+   loads Python progress independently. Each level has its own timer, answers,
+   and submission status.
+
+5. SIDEBAR RESPONSIVE BEHAVIOR
+   - >= 1024px (lg): sidebar open by default, persistent
+   - < 1024px (tablet/mobile): sidebar is an overlay, closes on outside click
+   - Selecting a level on < 1024px auto-closes the sidebar
+   - Body scroll lock when sidebar overlay is open on small screens
+
+6. SCORE CALCULATION
+   calculateScore() iterates all questions:
+   - userAnswers[i] === undefined || -1 → unattempted
+   - userAnswers[i] === question.correctAnswer → correct
+   - else → incorrect
+   percentage = Math.round((correct / total) * 100)
+   
+   On auto-submit (time up): unanswered get -1 (not the correct answer index)
+   so they count as unattempted, not wrong.
+
+7. CLERK JWT FLOW
+   Frontend calls Clerk's getToken() before each request.
+   Backend: clerkMiddleware() verifies this JWT and populates req.auth.
+   req.auth.userId = the Clerk user ID (used to scope data per user).
+   This is tamper-proof — userId comes from the signed JWT, not the body.
+
+================================================================================
+                          END OF TECHNICAL REFERENCE
+================================================================================

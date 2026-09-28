@@ -1,13 +1,30 @@
-import React from 'react'
+import { useAuth } from "@clerk/react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import { Show } from "@clerk/react";
+import Home from "./pages/Home";
+import MyResult from "./pages/MyResult";
 
-const App = () => {
+export default function App() {
+  const { isLoaded } = useAuth();
+  if (!isLoaded) return null;
+
   return (
-    <div>
-       <h1 className="text-3xl font-bold underline">
-    Hello world!
-  </h1>
-    </div>
-  )
-}
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route
+        path="/result"
+        element={
+          <>
+            <Show when="signed-in">
+              <MyResult />
+            </Show>
 
-export default App
+            <Show when="signed-out">
+              <Navigate to="/" />
+            </Show>
+          </>
+        }
+      />
+    </Routes>
+  );
+}
